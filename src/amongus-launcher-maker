@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+#
+# amongus-launcher-maker
+#
+# Generates a .desktop launcher (plus a small wrapper script) for a modded
+# Among Us installation that must be launched through the Protontricks
+# flatpak against the vanilla Among Us Proton prefix (Steam AppID 945360).
+#
+# Can be run fully interactively (Zenity dialogs when a GUI is available,
+# plain terminal prompts otherwise) or non-interactively via CLI flags —
+# see --help. Run it once per modded folder; each run produces its own
+# independently named wrapper + .desktop pair.
+#
+set -euo pipefail
+
+APPID=945360
+FLATPAK_ID="com.github.Matoking.protontricks"
+DEFAULT_WRAPPER_DIR="${HOME}/.local/share/amongus-launchers"
+
+# ---------------------------------------------------------------------------
+# CLI flags (all optional — anything not given is prompted for)
+# ---------------------------------------------------------------------------
+EXE_PATH=""
+DISPLAY_NAME=""
+DESKTOP_FILENAME=""
+DESKTOP_DIR=""
+WRAPPER_DIR=""
+FORCE=0          # overwrite existing wrapper/.desktop without asking
+NO_GUI=0         # skip zenity even if available
+ASSUME_YES=0     # answer "yes" to warnings (e.g. exe not named Among Us.exe)
+
+usage() {
+    cat <<EOF
+Usage: amongus-launcher-maker [OPTIONS]
+
+Creates a .desktop launcher for a modded Among Us install, launched through
+the Protontricks flatpak against the vanilla Among Us prefix (AppID ${APPID}).
+
+Options (anything omitted is asked interactively):
+  --exe PATH            Path to the modded "Among Us.exe"
+  --name NAME           Display name shown in the menu (e.g. "Town of Us")
+  --desktop-file NAME   Filename for the .desktop file (e.g. town-of-us.desktop)
+  --desktop-dir DIR     Directory to save the .desktop file in
+  --wrapper-dir DIR     Directory to save the wrapper script in
+                        (default: ${DEFAULT_WRAPPER_DIR})
+  --force               Overwrite existing wrapper/.desktop files
+  --yes                 Auto-accept warnings (non-standard exe name, etc.)
+  --no-gui              Use terminal prompts even if Zenity is available
+  -h, --help            Show this help
+
+Runtime requirements (checked at startup):
+  * flatpak with ${FLATPAK_ID} installed
+  * the flatpak must have home filesystem access:
+      flatpak override --user --filesystem=home ${FLATPAK_ID}
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --exe)          EXE_PATH="$2"; shift 2 ;;
+        --name)         DISPLAY_NAME="$2"; shift 2 ;;
+        --desktop-file) DESKTOP_FILENAME="$2"; shift 2 ;;
+        --desktop-dir)  DESKTOP_DIR="$2"; shift 2 ;;
+        --wrapper-dir)  WRAPPER_DIR="$2"; shift 2 ;;
+        --force)        FORCE=1; shift ;;
+        --yes)          ASSUME_YES=1; shift ;;
+        --no-gui)       NO_GUI=1; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Prompt helpers — Zenity when a GUI session is available, terminal otherwise
+# ---------------------------------------------------------------------------
+have_gui() {
+    [ "$NO_GUI" -eq 0 ] && command -v zenity >/dev/null 2>&1 \
+        && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }
+}
+
+# ask_file <dialog title> -> echoes chosen path
+ask_file() {
+    local title="$1" path=""
+    if have_gui; then
+        path=$(zenity --file-selection --title="$title" \
+                      --filename="${HOME}/.steam/steam/steamapps/common/" \
+                      --file-filter='Among Us.exe | *.exe' \
+                      --file-filter='All files | *' 2>/dev/null) || true
+    fi
+    if [ -z "$path" ]; then
+        read -e -r -p "$title: " path
+    fi
+    printf '%s' "$path"
+}
+
+# ask_text <prompt> [default] -> echoes answer
+ask_text() {
+    local prompt="$1" default="${2:-}" answer=""
+    if have_gui; then
+        answer=$(zenity --entry --title="amongus-launcher-maker" \
+                        --text="$prompt" --entry-text="$default" 2>/dev/null) || true
+    fi
+    if [ -z "$answer" ]; then
+        if [ -n "$default" ]; then
+            read -e -r -p "$prompt [$default]: " answer
+            answer="${answer:-$default}"
+        else
+            read -e -r -p "$prompt: " answer
+        fi
+    fi
+    printf '%s' "$answer"
+}
+
+# ask_dir <prompt> [default] -> echoes chosen directory
+ask_dir() {
+    local prompt="$1" default="${2:-}" dir=""
+    if have_gui; then
+        dir=$(zenity --file-selection --directory --title="$prompt" \
+                     ${default:+--filename="$default/"} 2>/dev/null) || true
+    fi
+    if [ -z "$dir" ]; then
+        if [ -n "$default" ]; then
+            read -e -r -p "$prompt [$default]: " dir
+            dir="${dir:-$default}"
+        else
+            read -e -r -p "$prompt: " dir
+        fi
+    fi
+    printf '%s' "$dir"
+}
+
+# confirm <question> -> exit status 0 = yes
+confirm() {
+    local question="$1" answer=""
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    if have_gui; then
+        zenity --question --title="amongus-launcher-maker" --text="$question" 2>/dev/null
+        return $?
+    fi
+    read -r -p "$question [y/N]: " answer
+    [[ "$answer" =~ ^[Yy] ]]
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo ">> $*"; }
+
+# ---------------------------------------------------------------------------
+# Step 1: verify flatpak + protontricks + home filesystem permission
+# ---------------------------------------------------------------------------
+check_protontricks() {
+    command -v flatpak >/dev/null 2>&1 \
+        || die "flatpak is not installed. Install it with: sudo apt install flatpak"
+
+    if ! flatpak info "$FLATPAK_ID" >/dev/null 2>&1; then
+        cat >&2 <<EOF
+ERROR: the Protontricks flatpak is not installed.
+
+Set it up with:
+  flatpak install flathub ${FLATPAK_ID}
+  flatpak override --user --filesystem=home ${FLATPAK_ID}
+EOF
+        exit 1
+    fi
+
+    # Home access can come from the app's baseline permissions or a user
+    # override — accept either "home" or full "host" filesystem access.
+    local perms
+    perms="$(flatpak info --show-permissions "$FLATPAK_ID" 2>/dev/null || true)
+$(flatpak override --user --show "$FLATPAK_ID" 2>/dev/null || true)"
+    if ! printf '%s' "$perms" | grep -Eq '^filesystems=.*(home|host)'; then
+        cat >&2 <<EOF
+ERROR: the Protontricks flatpak cannot read your home directory, so it
+cannot launch an exe under ~/.steam. Grant access with:
+
+  flatpak override --user --filesystem=home ${FLATPAK_ID}
+
+then re-run this tool.
+EOF
+        exit 1
+    fi
+    info "Protontricks flatpak found with home filesystem access."
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: pick and validate the exe
+# ---------------------------------------------------------------------------
+get_exe_path() {
+    while :; do
+        if [ -z "$EXE_PATH" ]; then
+            EXE_PATH="$(ask_file "Select the modded Among Us.exe")"
+        fi
+        [ -n "$EXE_PATH" ] || die "No exe path given."
+        # Normalise to an absolute path so the wrapper works from anywhere.
+        EXE_PATH="$(readlink -f "$EXE_PATH")"
+
+        if [ ! -f "$EXE_PATH" ]; then
+            echo "File does not exist: $EXE_PATH" >&2
+            EXE_PATH=""
+            continue
+        fi
+        if [ "$(basename "$EXE_PATH")" != "Among Us.exe" ]; then
+            if ! confirm "Warning: file is not named \"Among Us.exe\" ($(basename "$EXE_PATH")). Use it anyway?"; then
+                EXE_PATH=""
+                continue
+            fi
+        fi
+        break
+    done
+    info "Using exe: $EXE_PATH"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: ensure steam_appid.txt exists next to the exe
+# ---------------------------------------------------------------------------
+ensure_steam_appid() {
+    local dir appid_file current
+    dir="$(dirname "$EXE_PATH")"
+    appid_file="$dir/steam_appid.txt"
+    if [ -f "$appid_file" ]; then
+        current="$(tr -d '[:space:]' < "$appid_file")"
+        if [ "$current" = "$APPID" ]; then
+            info "steam_appid.txt already correct ($APPID)."
+            return
+        fi
+        if confirm "steam_appid.txt contains \"$current\" instead of $APPID. Overwrite it?"; then
+            printf '%s\n' "$APPID" > "$appid_file"
+            info "steam_appid.txt updated to $APPID."
+        else
+            info "Keeping existing steam_appid.txt (\"$current\") — launch may misbehave."
+        fi
+    else
+        printf '%s\n' "$APPID" > "$appid_file"
+        info "Created $appid_file with $APPID."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Step 4: gather launcher metadata (name, filenames, destinations)
+# ---------------------------------------------------------------------------
+gather_metadata() {
+    while [ -z "$DISPLAY_NAME" ]; do
+        DISPLAY_NAME="$(ask_text "Display name for this launcher (e.g. Town of Us)")"
+    done
+
+    while [ -z "$DESKTOP_FILENAME" ]; do
+        DESKTOP_FILENAME="$(ask_text "Filename for the .desktop file (e.g. town-of-us.desktop)")"
+    done
+    # Be forgiving: append the extension if the user left it off.
+    case "$DESKTOP_FILENAME" in
+        *.desktop) : ;;
+        *) DESKTOP_FILENAME="${DESKTOP_FILENAME}.desktop" ;;
+    esac
+
+    while [ -z "$DESKTOP_DIR" ]; do
+        DESKTOP_DIR="$(ask_dir "Where should the .desktop file be saved? (e.g. ${HOME}/.local/share/applications or ${HOME}/Desktop)")"
+    done
+    DESKTOP_DIR="$(readlink -m "$DESKTOP_DIR")"
+
+    if [ -z "$WRAPPER_DIR" ]; then
+        WRAPPER_DIR="$(ask_dir "Where should the wrapper script be saved?" "$DEFAULT_WRAPPER_DIR")"
+    fi
+    WRAPPER_DIR="$(readlink -m "$WRAPPER_DIR")"
+}
+
+# ---------------------------------------------------------------------------
+# Step 5: generate the wrapper script and the .desktop file
+# ---------------------------------------------------------------------------
+generate_files() {
+    local base wrapper_path desktop_path icon
+    base="${DESKTOP_FILENAME%.desktop}"
+    wrapper_path="$WRAPPER_DIR/${base}.sh"
+    desktop_path="$DESKTOP_DIR/$DESKTOP_FILENAME"
+
+    mkdir -p "$WRAPPER_DIR" "$DESKTOP_DIR"
+
+    for f in "$wrapper_path" "$desktop_path"; do
+        if [ -e "$f" ] && [ "$FORCE" -ne 1 ]; then
+            confirm "File already exists: $f — overwrite it?" \
+                || die "Aborted; pick a different .desktop filename to keep launchers independent."
+        fi
+    done
+
+    # Wrapper: bakes in the exe path and replicates the known-good manual
+    # launch command (SteamAppId/SteamGameId + protontricks-launch).
+    cat > "$wrapper_path" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by amongus-launcher-maker — do not edit by hand.
+# Launches: ${DISPLAY_NAME}
+export SteamAppId=${APPID}
+export SteamGameId=${APPID}
+exec flatpak run --command=protontricks-launch ${FLATPAK_ID} \\
+    --appid ${APPID} $(printf '%q' "$EXE_PATH")
+EOF
+    chmod 755 "$wrapper_path"
+    info "Wrapper script written: $wrapper_path"
+
+    # Reuse Steam's Among Us icon if the theme has it, otherwise fall back
+    # to a generic games icon.
+    icon="applications-games"
+    if compgen -G "${HOME}/.local/share/icons/hicolor/*/apps/steam_icon_${APPID}.png" > /dev/null; then
+        icon="steam_icon_${APPID}"
+    fi
+
+    cat > "$desktop_path" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${DISPLAY_NAME}
+Comment=Modded Among Us (via Protontricks, AppID ${APPID})
+Exec="${wrapper_path}"
+Icon=${icon}
+Terminal=false
+Categories=Game;
+StartupNotify=false
+EOF
+    chmod 755 "$desktop_path"
+    info ".desktop file written: $desktop_path"
+
+    # On Cinnamon/GNOME a .desktop on the Desktop must also be marked
+    # trusted before it is clickable; best-effort, harmless elsewhere.
+    if command -v gio >/dev/null 2>&1; then
+        gio set "$desktop_path" metadata::trusted true 2>/dev/null || true
+    fi
+
+    echo
+    echo "Done! \"${DISPLAY_NAME}\" is ready:"
+    echo "  launcher : $desktop_path"
+    echo "  wrapper  : $wrapper_path"
+    echo "  exe      : $EXE_PATH"
+    echo
+    echo "Run this tool again any time to add launchers for other modded folders."
+}
+
+check_protontricks
+get_exe_path
+ensure_steam_appid
+gather_metadata
+generate_files
